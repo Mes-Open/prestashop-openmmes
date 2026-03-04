@@ -2,6 +2,8 @@
 
 A PrestaShop module that automatically creates **work orders** in [OpenMES](https://github.com/Mes-Open/OpenMes) whenever a customer places an order containing a product marked as "manufactured".
 
+> **Part of the OpenMES ecosystem** — see the main project at [github.com/Mes-Open/OpenMes](https://github.com/Mes-Open/OpenMes)
+
 ---
 
 ## Features
@@ -92,6 +94,13 @@ Logs: **Advanced Parameters → Logs** (filter by `[OpenMES]`).
 
 ---
 
+## Related
+
+- [OpenMES — main repository](https://github.com/Mes-Open/OpenMes)
+- [OpenMES documentation](https://github.com/Mes-Open/OpenMes#readme)
+
+---
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)
