@@ -1,9 +1,14 @@
 <?php
+
+declare(strict_types=1);
+
 /**
  * OpenMES Connector for PrestaShop
  *
  * Sends new orders to OpenMES as work orders when products
  * are marked as "manufactured" (custom product flag).
+ * Automatically creates restock work orders when stock drops
+ * to 0 or below for products that allow out-of-stock ordering.
  *
  * @author   OpenMES Team
  * @license  MIT
@@ -15,16 +20,22 @@ if (!defined('_PS_VERSION_')) {
 
 class OpenmesConnector extends Module
 {
-    const CONFIG_API_URL    = 'OPENMESCONN_API_URL';
-    const CONFIG_API_TOKEN  = 'OPENMESCONN_API_TOKEN';
-    const CONFIG_LINE_ID    = 'OPENMESCONN_DEFAULT_LINE_ID';
-    const CONFIG_ENABLED    = 'OPENMESCONN_ENABLED';
+    public const CONFIG_API_URL   = 'OPENMESCONN_API_URL';
+    public const CONFIG_API_TOKEN = 'OPENMESCONN_API_TOKEN';
+    public const CONFIG_LINE_ID   = 'OPENMESCONN_DEFAULT_LINE_ID';
+    public const CONFIG_ENABLED   = 'OPENMESCONN_ENABLED';
+
+    /** @var Db */
+    private Db $db;
+
+    /** @var int[] Product IDs that already had a WO created via actionValidateOrder in this request */
+    private array $orderWoCreatedFor = [];
 
     public function __construct()
     {
         $this->name          = 'openmesconnector';
         $this->tab           = 'administration';
-        $this->version       = '1.0.0';
+        $this->version       = '1.1.0';
         $this->author        = 'OpenMES Team';
         $this->need_instance = 0;
         $this->bootstrap     = true;
@@ -34,6 +45,8 @@ class OpenmesConnector extends Module
         ];
 
         parent::__construct();
+
+        $this->db = Db::getInstance();
 
         $this->displayName = $this->l('OpenMES Connector');
         $this->description = $this->l(
@@ -48,6 +61,7 @@ class OpenmesConnector extends Module
     {
         return parent::install()
             && $this->registerHook('actionValidateOrder')
+            && $this->registerHook('actionUpdateQuantity')
             && $this->registerHook('displayAdminProductsExtra')
             && $this->registerHook('actionProductSave')
             && $this->installDb()
@@ -74,12 +88,12 @@ class OpenmesConnector extends Module
             PRIMARY KEY (`id_product`)
         ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8;';
 
-        return Db::getInstance()->execute($sql);
+        return $this->db->execute($sql);
     }
 
     private function uninstallDb(): bool
     {
-        return Db::getInstance()->execute(
+        return $this->db->execute(
             'DROP TABLE IF EXISTS `' . _DB_PREFIX_ . 'openmesconn_product`'
         );
     }
@@ -101,9 +115,9 @@ class OpenmesConnector extends Module
 
     private function uninstallTab(): bool
     {
-        $id_tab = (int) Tab::getIdFromClassName('AdminOpenmesConnector');
-        if ($id_tab) {
-            $tab = new Tab($id_tab);
+        $idTab = (int) Tab::getIdFromClassName('AdminOpenmesConnector');
+        if ($idTab) {
+            $tab = new Tab($idTab);
             return $tab->delete();
         }
         return true;
@@ -133,9 +147,9 @@ class OpenmesConnector extends Module
             return $this->displayError($this->l('Invalid API URL.'));
         }
 
-        Configuration::updateValue(self::CONFIG_API_URL,   $apiUrl);
-        Configuration::updateValue(self::CONFIG_LINE_ID,   $lineId);
-        Configuration::updateValue(self::CONFIG_ENABLED,   $enabled);
+        Configuration::updateValue(self::CONFIG_API_URL, $apiUrl);
+        Configuration::updateValue(self::CONFIG_LINE_ID, $lineId);
+        Configuration::updateValue(self::CONFIG_ENABLED, $enabled);
 
         if (!empty($apiToken)) {
             Configuration::updateValue(self::CONFIG_API_TOKEN, $apiToken);
@@ -146,11 +160,11 @@ class OpenmesConnector extends Module
 
     private function renderSettingsForm(): string
     {
-        $lines   = $this->fetchOpenMesLines();
-        $options = [['id' => 0, 'name' => '— ' . $this->l('No default line') . ' —']];
-        foreach ($lines as $line) {
-            $options[] = ['id' => (int) $line['id'], 'name' => $line['name']];
-        }
+        $options = $this->buildLineOptions($this->l('No default line'));
+
+        $tokenDesc = $this->l(
+            'Bearer token from OpenMES Settings. Leave blank to keep existing token.'
+        );
 
         $form = [
             'form' => [
@@ -165,7 +179,7 @@ class OpenmesConnector extends Module
                         'name'     => self::CONFIG_ENABLED,
                         'is_bool'  => true,
                         'values'   => [
-                            ['id' => 'active_on',  'value' => 1, 'label' => $this->l('Enabled')],
+                            ['id' => 'active_on', 'value' => 1, 'label' => $this->l('Enabled')],
                             ['id' => 'active_off', 'value' => 0, 'label' => $this->l('Disabled')],
                         ],
                     ],
@@ -174,13 +188,13 @@ class OpenmesConnector extends Module
                         'label'    => $this->l('OpenMES API URL'),
                         'name'     => self::CONFIG_API_URL,
                         'required' => true,
-                        'desc'     => $this->l('Base URL of your OpenMES instance, e.g. https://demo.getopenmes.com'),
+                        'desc'     => $this->l('Base URL, e.g. https://demo.getopenmes.com'),
                     ],
                     [
                         'type'     => 'password',
                         'label'    => $this->l('API Token'),
                         'name'     => self::CONFIG_API_TOKEN,
-                        'desc'     => $this->l('Bearer token from OpenMES Settings → API Tokens. Leave blank to keep existing token.'),
+                        'desc'     => $tokenDesc,
                     ],
                     [
                         'type'     => 'select',
@@ -205,7 +219,8 @@ class OpenmesConnector extends Module
         $helper->table             = '';
         $helper->default_form_language = (int) Configuration::get('PS_LANG_DEFAULT');
         $helper->submit_action     = 'submitOpenmesConnector';
-        $helper->currentIndex      = AdminController::$currentIndex . '&configure=' . $this->name;
+        $helper->currentIndex      = AdminController::$currentIndex
+            . '&configure=' . $this->name;
         $helper->token             = Tools::getAdminTokenLite('AdminModules');
 
         $helper->fields_value = [
@@ -222,102 +237,242 @@ class OpenmesConnector extends Module
 
     public function hookDisplayAdminProductsExtra(array $params): string
     {
-        $idProduct = (int) ($params['id_product'] ?? Tools::getValue('id_product'));
-        if (!$idProduct) {
+        try {
+            $idProduct = (int) ($params['id_product'] ?? Tools::getValue('id_product'));
+            if (!$idProduct) {
+                return '';
+            }
+
+            $row = $this->getManufactureRow($idProduct, false);
+
+            $this->context->smarty->assign([
+                'openmesconn_manufacture' => (bool) ($row['manufacture'] ?? false),
+                'openmesconn_line_id'     => (int) ($row['line_id'] ?? 0),
+                'openmesconn_lines'       => $this->buildLineOptions($this->l('Use default line')),
+            ]);
+
+            return $this->display(__FILE__, 'views/templates/hook/product_tab.tpl');
+        } catch (\Throwable $e) {
+            PrestaShopLogger::addLog(
+                '[OpenMES] Error in hookDisplayAdminProductsExtra: ' . $e->getMessage(),
+                3
+            );
             return '';
         }
-
-        $row = Db::getInstance()->getRow(
-            'SELECT * FROM `' . _DB_PREFIX_ . 'openmesconn_product` WHERE id_product = ' . $idProduct
-        );
-
-        $lines    = $this->fetchOpenMesLines();
-        $options  = [['id' => 0, 'name' => '— ' . $this->l('Use default line') . ' —']];
-        foreach ($lines as $line) {
-            $options[] = ['id' => (int) $line['id'], 'name' => $line['name']];
-        }
-
-        $this->context->smarty->assign([
-            'openmesconn_manufacture' => (bool) ($row['manufacture'] ?? false),
-            'openmesconn_line_id'     => (int)  ($row['line_id']     ?? 0),
-            'openmesconn_lines'       => $options,
-        ]);
-
-        return $this->display(__FILE__, 'views/templates/hook/product_tab.tpl');
     }
 
     public function hookActionProductSave(array $params): void
     {
-        $idProduct = (int) ($params['id_product'] ?? 0);
-        if (!$idProduct) {
-            return;
+        try {
+            $idProduct = (int) ($params['id_product'] ?? 0);
+            if (!$idProduct) {
+                return;
+            }
+
+            $manufacture = (int) Tools::getValue('openmesconn_manufacture', 0);
+            $lineId      = (int) Tools::getValue('openmesconn_line_id', 0) ?: null;
+
+            $this->db->execute(
+                'INSERT INTO `' . _DB_PREFIX_ . 'openmesconn_product`
+                    (id_product, manufacture, line_id)
+                 VALUES ('
+                    . (int) $idProduct . ', '
+                    . (int) $manufacture . ', '
+                    . ((int) $lineId ?: 'NULL') . ')
+                 ON DUPLICATE KEY UPDATE
+                    manufacture = ' . (int) $manufacture . ',
+                    line_id     = ' . ((int) $lineId ?: 'NULL')
+            );
+        } catch (\Throwable $e) {
+            PrestaShopLogger::addLog(
+                '[OpenMES] Error in hookActionProductSave: ' . $e->getMessage(),
+                3,
+                null,
+                'Product',
+                (int) ($params['id_product'] ?? 0)
+            );
         }
-
-        $manufacture = (int) Tools::getValue('openmesconn_manufacture', 0);
-        $lineId      = (int) Tools::getValue('openmesconn_line_id', 0) ?: null;
-
-        Db::getInstance()->execute(
-            'INSERT INTO `' . _DB_PREFIX_ . 'openmesconn_product`
-                (id_product, manufacture, line_id)
-             VALUES (' . $idProduct . ', ' . $manufacture . ', ' . ($lineId ?? 'NULL') . ')
-             ON DUPLICATE KEY UPDATE
-                manufacture = ' . $manufacture . ',
-                line_id     = ' . ($lineId ?? 'NULL')
-        );
     }
 
     public function hookActionValidateOrder(array $params): void
     {
-        if (!(int) Configuration::get(self::CONFIG_ENABLED)) {
-            return;
-        }
-
-        /** @var Order $order */
-        $order = $params['order'] ?? null;
-        if (!$order || !Validate::isLoadedObject($order)) {
-            return;
-        }
-
-        foreach ($order->getProducts() as $product) {
-            $idProduct = (int) $product['product_id'];
-            $row = Db::getInstance()->getRow(
-                'SELECT * FROM `' . _DB_PREFIX_ . 'openmesconn_product`
-                 WHERE id_product = ' . $idProduct . ' AND manufacture = 1'
-            );
-
-            if (!$row) {
-                continue;
+        try {
+            if (!(int) Configuration::get(self::CONFIG_ENABLED)) {
+                return;
             }
 
-            $lineId = (int) ($row['line_id'] ?: Configuration::get(self::CONFIG_LINE_ID)) ?: null;
-            $this->createOpenMesWorkOrder($order, $product, $lineId);
+            /** @var Order $order */
+            $order = $params['order'] ?? null;
+            if (!$order || !Validate::isLoadedObject($order)) {
+                return;
+            }
+
+            $credentials = $this->getApiCredentials();
+            if (!$credentials) {
+                PrestaShopLogger::addLog(
+                    '[OpenMES] Integration not configured — skipping order #' . $order->id,
+                    2,
+                    null,
+                    'Order',
+                    (int) $order->id
+                );
+                return;
+            }
+
+            foreach ($order->getProducts() as $product) {
+                $idProduct = (int) $product['product_id'];
+                $row = $this->getManufactureRow($idProduct);
+
+                if (!$row) {
+                    continue;
+                }
+
+                $lineId = $this->resolveLineId($row);
+                $this->createOrderWorkOrder($credentials, $order, $product, $lineId);
+
+                $this->orderWoCreatedFor[] = $idProduct;
+            }
+        } catch (\Throwable $e) {
+            PrestaShopLogger::addLog(
+                '[OpenMES] Error in hookActionValidateOrder: ' . $e->getMessage(),
+                3,
+                null,
+                'Order',
+                (int) ($params['order']->id ?? 0)
+            );
+        }
+    }
+
+    /**
+     * When stock drops to 0 or below, create a restock work order in OpenMES
+     * for products that are marked as manufactured AND allow ordering
+     * when out of stock.
+     */
+    public function hookActionUpdateQuantity(array $params): void
+    {
+        try {
+            if (!(int) Configuration::get(self::CONFIG_ENABLED)) {
+                return;
+            }
+
+            $idProduct          = (int) ($params['id_product'] ?? 0);
+            $idProductAttribute = (int) ($params['id_product_attribute'] ?? 0);
+            $newQty             = (int) ($params['quantity'] ?? 0);
+
+            if (!$idProduct || $newQty > 0) {
+                return;
+            }
+
+            // Skip if actionValidateOrder already created a WO for this product in this request
+            if (in_array($idProduct, $this->orderWoCreatedFor, true)) {
+                return;
+            }
+
+            $row = $this->getManufactureRow($idProduct);
+            if (!$row) {
+                return;
+            }
+
+            if (!$this->isOrderableWhenOutOfStock($idProduct)) {
+                return;
+            }
+
+            $credentials = $this->getApiCredentials();
+            if (!$credentials) {
+                PrestaShopLogger::addLog(
+                    '[OpenMES] Integration not configured — skipping restock for product #'
+                        . $idProduct,
+                    2,
+                    null,
+                    'Product',
+                    $idProduct
+                );
+                return;
+            }
+
+            $productObj = new Product(
+                $idProduct,
+                false,
+                (int) Configuration::get('PS_LANG_DEFAULT')
+            );
+            $lineId     = $this->resolveLineId($row);
+            $plannedQty = $newQty < 0 ? (float) abs($newQty) : 1.0;
+            $orderNo    = 'PS-RESTOCK-' . $idProduct
+                . ($idProductAttribute ? '-' . $idProductAttribute : '')
+                . '-' . bin2hex(random_bytes(4));
+
+            $payload = [
+                'order_no'    => $orderNo,
+                'planned_qty' => $plannedQty,
+                'description' => $this->l('Auto restock — product out of stock')
+                    . ': ' . $productObj->name . ' (stock: ' . $newQty . ')',
+                'extra_data'  => [
+                    'source'               => 'prestashop',
+                    'trigger'              => 'out_of_stock',
+                    'ps_product_id'        => $idProduct,
+                    'ps_product_attribute' => $idProductAttribute,
+                    'ps_product_name'      => $productObj->name,
+                    'ps_product_ref'       => $productObj->reference ?? '',
+                    'ps_stock_quantity'    => $newQty,
+                ],
+            ];
+
+            if ($lineId) {
+                $payload['line_id'] = $lineId;
+            }
+
+            $this->sendWorkOrder($credentials, $payload, 'Product', $idProduct);
+        } catch (\Throwable $e) {
+            PrestaShopLogger::addLog(
+                '[OpenMES] Error in hookActionUpdateQuantity: ' . $e->getMessage(),
+                3,
+                null,
+                'Product',
+                (int) ($params['id_product'] ?? 0)
+            );
         }
     }
 
     // ── OpenMES API ──────────────────────────────────────────────────────────
 
-    private function createOpenMesWorkOrder(Order $order, array $product, ?int $lineId): void
+    /**
+     * Get API URL and token from configuration.
+     *
+     * @return array{url: string, token: string}|null
+     */
+    private function getApiCredentials(): ?array
     {
-        $apiUrl   = rtrim(Configuration::get(self::CONFIG_API_URL), '/');
-        $apiToken = Configuration::get(self::CONFIG_API_TOKEN);
+        $url   = rtrim((string) Configuration::get(self::CONFIG_API_URL), '/');
+        $token = (string) Configuration::get(self::CONFIG_API_TOKEN);
 
-        if (empty($apiUrl) || empty($apiToken)) {
-            PrestaShopLogger::addLog(
-                '[OpenMES] Integration not configured — skipping order #' . $order->id,
-                2, null, 'Order', (int) $order->id
-            );
-            return;
+        if ($url === '' || $token === '') {
+            return null;
         }
 
-        $orderRef = $order->reference ?? ('PS-' . str_pad($order->id, 8, '0', STR_PAD_LEFT));
+        return ['url' => $url, 'token' => $token];
+    }
+
+    /**
+     * Build a work-order payload for a validated PS order and send it.
+     */
+    private function createOrderWorkOrder(
+        array $credentials,
+        Order $order,
+        array $product,
+        ?int $lineId
+    ): void {
+        $orderRef = $order->reference
+            ?? ('PS-' . str_pad((string) $order->id, 8, '0', STR_PAD_LEFT));
         $orderNo  = 'PS-' . $orderRef . '-' . $product['product_id'];
 
         $payload = [
             'order_no'    => $orderNo,
             'planned_qty' => (float) $product['product_quantity'],
-            'description' => $this->l('PrestaShop order') . ' #' . $orderRef . ' — ' . $product['product_name'],
+            'description' => $this->l('PrestaShop order')
+                . ' #' . $orderRef . ' — ' . $product['product_name'],
             'extra_data'  => [
                 'source'          => 'prestashop',
+                'trigger'         => 'order',
                 'ps_order_id'     => (int) $order->id,
                 'ps_order_ref'    => $orderRef,
                 'ps_product_id'   => (int) $product['product_id'],
@@ -331,36 +486,69 @@ class OpenmesConnector extends Module
             $payload['line_id'] = $lineId;
         }
 
-        $response = $this->apiPost($apiUrl . '/api/v1/work-orders', $apiToken, $payload);
+        $this->sendWorkOrder($credentials, $payload, 'Order', (int) $order->id);
+    }
+
+    /**
+     * POST a work-order payload to OpenMES and log the result.
+     *
+     * @param array{url: string, token: string} $credentials
+     */
+    private function sendWorkOrder(
+        array $credentials,
+        array $payload,
+        string $objectType,
+        int $objectId
+    ): void {
+        $response = $this->apiPost(
+            $credentials['url'] . '/api/v1/work-orders',
+            $credentials['token'],
+            $payload
+        );
+
+        $orderNo = $payload['order_no'];
 
         if ($response === false || isset($response['error'])) {
             $msg = $response['message'] ?? 'Unknown error';
             PrestaShopLogger::addLog(
-                '[OpenMES] Failed to create work order for order #' . $order->id . ': ' . $msg,
-                3, null, 'Order', (int) $order->id
+                '[OpenMES] Failed to create work order ' . $orderNo . ': ' . $msg,
+                3,
+                null,
+                $objectType,
+                $objectId
             );
         } else {
+            $woId = $response['data']['id'] ?? '?';
             PrestaShopLogger::addLog(
-                '[OpenMES] Work order created: ' . $orderNo . ' (ID: ' . ($response['data']['id'] ?? '?') . ')',
-                1, null, 'Order', (int) $order->id
+                '[OpenMES] Work order created: ' . $orderNo . ' (ID: ' . $woId . ')',
+                1,
+                null,
+                $objectType,
+                $objectId
             );
         }
     }
 
     private function fetchOpenMesLines(): array
     {
-        $apiUrl   = rtrim(Configuration::get(self::CONFIG_API_URL), '/');
-        $apiToken = Configuration::get(self::CONFIG_API_TOKEN);
-
-        if (empty($apiUrl) || empty($apiToken)) {
+        $credentials = $this->getApiCredentials();
+        if (!$credentials) {
             return [];
         }
 
-        $response = $this->apiGet($apiUrl . '/api/v1/lines', $apiToken);
+        $response = $this->apiGet(
+            $credentials['url'] . '/api/v1/lines',
+            $credentials['token']
+        );
 
-        return (is_array($response) && isset($response['data'])) ? $response['data'] : [];
+        return (is_array($response) && isset($response['data']))
+            ? $response['data']
+            : [];
     }
 
+    /**
+     * @return array|false Decoded JSON body or false on failure
+     */
     private function apiPost(string $url, string $token, array $payload): array|false
     {
         $ch = curl_init($url);
@@ -369,6 +557,7 @@ class OpenmesConnector extends Module
             CURLOPT_POST           => true,
             CURLOPT_POSTFIELDS     => json_encode($payload),
             CURLOPT_TIMEOUT        => 10,
+            CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_HTTPHEADER     => [
                 'Content-Type: application/json',
                 'Accept: application/json',
@@ -376,40 +565,160 @@ class OpenmesConnector extends Module
             ],
         ]);
 
-        $body = curl_exec($ch);
-        $err  = curl_error($ch);
+        $body      = curl_exec($ch);
+        $err       = curl_error($ch);
+        $httpCode  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $totalTime = round((float) curl_getinfo($ch, CURLINFO_TOTAL_TIME), 3);
         curl_close($ch);
 
         if ($body === false || $err) {
-            PrestaShopLogger::addLog('[OpenMES] cURL error: ' . $err, 3);
+            PrestaShopLogger::addLog(
+                '[OpenMES] cURL POST error for ' . $url . ': ' . $err,
+                3
+            );
             return false;
         }
 
-        $decoded = json_decode($body, true);
+        if ($httpCode >= 400) {
+            PrestaShopLogger::addLog(
+                '[OpenMES] cURL POST ' . $url
+                    . ' — HTTP ' . $httpCode . ' in ' . $totalTime . 's'
+                    . ' — response: ' . $this->truncateForLog((string) $body),
+                3
+            );
+            $decoded = json_decode((string) $body, true);
+            if (is_array($decoded)) {
+                $decoded['_http_code'] = $httpCode;
+                return $decoded;
+            }
+            return false;
+        }
+
+        $decoded = json_decode((string) $body, true);
         return is_array($decoded) ? $decoded : false;
     }
 
+    /**
+     * @return array|false Decoded JSON body or false on failure
+     */
     private function apiGet(string $url, string $token): array|false
     {
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT        => 10,
+            CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_HTTPHEADER     => [
                 'Accept: application/json',
                 'Authorization: Bearer ' . $token,
             ],
         ]);
 
-        $body = curl_exec($ch);
-        $err  = curl_error($ch);
+        $body      = curl_exec($ch);
+        $err       = curl_error($ch);
+        $httpCode  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $totalTime = round((float) curl_getinfo($ch, CURLINFO_TOTAL_TIME), 3);
         curl_close($ch);
 
         if ($body === false || $err) {
+            PrestaShopLogger::addLog(
+                '[OpenMES] cURL GET error for ' . $url . ': ' . $err,
+                3
+            );
             return false;
         }
 
-        $decoded = json_decode($body, true);
+        if ($httpCode >= 400) {
+            PrestaShopLogger::addLog(
+                '[OpenMES] cURL GET ' . $url
+                    . ' — HTTP ' . $httpCode . ' in ' . $totalTime . 's'
+                    . ' — response: ' . $this->truncateForLog((string) $body),
+                3
+            );
+            return false;
+        }
+
+        $decoded = json_decode((string) $body, true);
         return is_array($decoded) ? $decoded : false;
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Fetch the manufacture row for a product.
+     * When $onlyManufactured is true, only returns rows with manufacture = 1.
+     */
+    private function getManufactureRow(int $idProduct, bool $onlyManufactured = true): ?array
+    {
+        $sql = new DbQuery();
+        $sql->select('*')
+            ->from('openmesconn_product')
+            ->where('id_product = ' . (int) $idProduct);
+
+        if ($onlyManufactured) {
+            $sql->where('manufacture = 1');
+        }
+
+        $row = $this->db->getRow($sql);
+        return $row ?: null;
+    }
+
+    /**
+     * Resolve the production line ID — product-specific or module default.
+     */
+    private function resolveLineId(array $row): ?int
+    {
+        $lineId = (int) ($row['line_id'] ?: Configuration::get(self::CONFIG_LINE_ID));
+        return $lineId ?: null;
+    }
+
+    /**
+     * Check if a product allows ordering when out of stock.
+     */
+    private function isOrderableWhenOutOfStock(int $idProduct): bool
+    {
+        $outOfStock = (int) StockAvailable::outOfStock(
+            $idProduct,
+            null,
+            Context::getContext()->shop->id ?? null
+        );
+
+        // 0 = deny orders, 1 = allow orders, 2 = use global setting
+        if ($outOfStock === 0) {
+            return false;
+        }
+
+        if ($outOfStock === 2) {
+            return (bool) (int) Configuration::get('PS_ORDER_OUT_OF_STOCK');
+        }
+
+        return true;
+    }
+
+    /**
+     * Build line options array for select dropdowns.
+     */
+    private function buildLineOptions(string $emptyLabel): array
+    {
+        $lines   = $this->fetchOpenMesLines();
+        $options = [['id' => 0, 'name' => '— ' . $emptyLabel . ' —']];
+
+        foreach ($lines as $line) {
+            $options[] = ['id' => (int) $line['id'], 'name' => $line['name']];
+        }
+
+        return $options;
+    }
+
+    /**
+     * Truncate a string for safe log storage.
+     */
+    private function truncateForLog(string $text, int $maxLength = 500): string
+    {
+        if (strlen($text) <= $maxLength) {
+            return $text;
+        }
+
+        return substr($text, 0, $maxLength) . '... [truncated]';
     }
 }
