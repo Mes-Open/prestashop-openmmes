@@ -10,7 +10,7 @@ $sql[] = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . 'openmesconn_product` (
     `manufacture`   TINYINT(1)       NOT NULL DEFAULT 0,
     `line_id`       INT(10) UNSIGNED          DEFAULT NULL,
     PRIMARY KEY (`id_product`)
-) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8';
+) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci';
 
 foreach ($sql as $query) {
     if (Db::getInstance()->execute($query) === false) {

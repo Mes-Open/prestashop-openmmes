@@ -20,8 +20,8 @@ A PrestaShop module that automatically creates **work orders** in [OpenMES](http
 
 | Requirement | Version |
 |---|---|
-| PrestaShop | 1.7.8+ / 8.x |
-| PHP | 7.4+ |
+| PrestaShop | 1.7.8+ / 8.x / 9.x |
+| PHP | 8.1+ |
 | OpenMES | any version with REST API |
 | PHP extension | `curl` |
 

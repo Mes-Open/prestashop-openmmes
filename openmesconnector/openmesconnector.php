@@ -7,8 +7,6 @@ declare(strict_types=1);
  *
  * Sends new orders to OpenMES as work orders when products
  * are marked as "manufactured" (custom product flag).
- * Automatically creates restock work orders when stock drops
- * to 0 or below for products that allow out-of-stock ordering.
  *
  * @author   OpenMES Team
  * @license  MIT
@@ -28,20 +26,17 @@ class OpenmesConnector extends Module
     /** @var Db */
     private Db $db;
 
-    /** @var int[] Product IDs that already had a WO created via actionValidateOrder in this request */
-    private array $orderWoCreatedFor = [];
-
     public function __construct()
     {
         $this->name          = 'openmesconnector';
         $this->tab           = 'administration';
-        $this->version       = '1.1.0';
+        $this->version       = '1.2.0';
         $this->author        = 'OpenMES Team';
         $this->need_instance = 0;
         $this->bootstrap     = true;
         $this->ps_versions_compliancy = [
-            'min' => '1.7.0',
-            'max' => '8.99.99',
+            'min' => '1.7.8.0',
+            'max' => '9.99.99',
         ];
 
         parent::__construct();
@@ -61,7 +56,6 @@ class OpenmesConnector extends Module
     {
         return parent::install()
             && $this->registerHook('actionValidateOrder')
-            && $this->registerHook('actionUpdateQuantity')
             && $this->registerHook('displayAdminProductsExtra')
             && $this->registerHook('actionProductSave')
             && $this->installDb()
@@ -86,7 +80,7 @@ class OpenmesConnector extends Module
             `manufacture`       TINYINT(1) NOT NULL DEFAULT 0,
             `line_id`           INT(10) UNSIGNED DEFAULT NULL,
             PRIMARY KEY (`id_product`)
-        ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8;';
+        ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;';
 
         return $this->db->execute($sql);
     }
@@ -138,8 +132,8 @@ class OpenmesConnector extends Module
 
     private function saveSettings(): string
     {
-        $apiUrl   = rtrim(Tools::getValue(self::CONFIG_API_URL), '/');
-        $apiToken = Tools::getValue(self::CONFIG_API_TOKEN);
+        $apiUrl   = rtrim((string) Tools::getValue(self::CONFIG_API_URL), '/');
+        $apiToken = (string) Tools::getValue(self::CONFIG_API_TOKEN);
         $lineId   = (int) Tools::getValue(self::CONFIG_LINE_ID);
         $enabled  = (int) Tools::getValue(self::CONFIG_ENABLED);
 
@@ -329,106 +323,15 @@ class OpenmesConnector extends Module
 
                 $lineId = $this->resolveLineId($row);
                 $this->createOrderWorkOrder($credentials, $order, $product, $lineId);
-
-                $this->orderWoCreatedFor[] = $idProduct;
             }
         } catch (\Throwable $e) {
+            $orderForLog = $params['order'] ?? null;
             PrestaShopLogger::addLog(
                 '[OpenMES] Error in hookActionValidateOrder: ' . $e->getMessage(),
                 3,
                 null,
                 'Order',
-                (int) ($params['order']->id ?? 0)
-            );
-        }
-    }
-
-    /**
-     * When stock drops to 0 or below, create a restock work order in OpenMES
-     * for products that are marked as manufactured AND allow ordering
-     * when out of stock.
-     */
-    public function hookActionUpdateQuantity(array $params): void
-    {
-        try {
-            if (!(int) Configuration::get(self::CONFIG_ENABLED)) {
-                return;
-            }
-
-            $idProduct          = (int) ($params['id_product'] ?? 0);
-            $idProductAttribute = (int) ($params['id_product_attribute'] ?? 0);
-            $newQty             = (int) ($params['quantity'] ?? 0);
-
-            if (!$idProduct || $newQty > 0) {
-                return;
-            }
-
-            // Skip if actionValidateOrder already created a WO for this product in this request
-            if (in_array($idProduct, $this->orderWoCreatedFor, true)) {
-                return;
-            }
-
-            $row = $this->getManufactureRow($idProduct);
-            if (!$row) {
-                return;
-            }
-
-            if (!$this->isOrderableWhenOutOfStock($idProduct)) {
-                return;
-            }
-
-            $credentials = $this->getApiCredentials();
-            if (!$credentials) {
-                PrestaShopLogger::addLog(
-                    '[OpenMES] Integration not configured — skipping restock for product #'
-                        . $idProduct,
-                    2,
-                    null,
-                    'Product',
-                    $idProduct
-                );
-                return;
-            }
-
-            $productObj = new Product(
-                $idProduct,
-                false,
-                (int) Configuration::get('PS_LANG_DEFAULT')
-            );
-            $lineId     = $this->resolveLineId($row);
-            $plannedQty = $newQty < 0 ? (float) abs($newQty) : 1.0;
-            $orderNo    = 'PS-RESTOCK-' . $idProduct
-                . ($idProductAttribute ? '-' . $idProductAttribute : '')
-                . '-' . bin2hex(random_bytes(4));
-
-            $payload = [
-                'order_no'    => $orderNo,
-                'planned_qty' => $plannedQty,
-                'description' => $this->l('Auto restock — product out of stock')
-                    . ': ' . $productObj->name . ' (stock: ' . $newQty . ')',
-                'extra_data'  => [
-                    'source'               => 'prestashop',
-                    'trigger'              => 'out_of_stock',
-                    'ps_product_id'        => $idProduct,
-                    'ps_product_attribute' => $idProductAttribute,
-                    'ps_product_name'      => $productObj->name,
-                    'ps_product_ref'       => $productObj->reference ?? '',
-                    'ps_stock_quantity'    => $newQty,
-                ],
-            ];
-
-            if ($lineId) {
-                $payload['line_id'] = $lineId;
-            }
-
-            $this->sendWorkOrder($credentials, $payload, 'Product', $idProduct);
-        } catch (\Throwable $e) {
-            PrestaShopLogger::addLog(
-                '[OpenMES] Error in hookActionUpdateQuantity: ' . $e->getMessage(),
-                3,
-                null,
-                'Product',
-                (int) ($params['id_product'] ?? 0)
+                (int) ($orderForLog?->id ?? 0)
             );
         }
     }
@@ -509,7 +412,7 @@ class OpenmesConnector extends Module
         $orderNo = $payload['order_no'];
 
         if ($response === false || isset($response['error'])) {
-            $msg = $response['message'] ?? 'Unknown error';
+            $msg = is_array($response) ? ($response['message'] ?? 'Unknown error') : 'Unknown error';
             PrestaShopLogger::addLog(
                 '[OpenMES] Failed to create work order ' . $orderNo . ': ' . $msg,
                 3,
@@ -518,7 +421,7 @@ class OpenmesConnector extends Module
                 $objectId
             );
         } else {
-            $woId = $response['data']['id'] ?? '?';
+            $woId = (is_array($response['data'] ?? null) ? ($response['data']['id'] ?? null) : null) ?? '?';
             PrestaShopLogger::addLog(
                 '[OpenMES] Work order created: ' . $orderNo . ' (ID: ' . $woId . ')',
                 1,
@@ -668,31 +571,8 @@ class OpenmesConnector extends Module
      */
     private function resolveLineId(array $row): ?int
     {
-        $lineId = (int) ($row['line_id'] ?: Configuration::get(self::CONFIG_LINE_ID));
+        $lineId = (int) (($row['line_id'] ?? null) ?: Configuration::get(self::CONFIG_LINE_ID));
         return $lineId ?: null;
-    }
-
-    /**
-     * Check if a product allows ordering when out of stock.
-     */
-    private function isOrderableWhenOutOfStock(int $idProduct): bool
-    {
-        $outOfStock = (int) StockAvailable::outOfStock(
-            $idProduct,
-            null,
-            Context::getContext()->shop->id ?? null
-        );
-
-        // 0 = deny orders, 1 = allow orders, 2 = use global setting
-        if ($outOfStock === 0) {
-            return false;
-        }
-
-        if ($outOfStock === 2) {
-            return (bool) (int) Configuration::get('PS_ORDER_OUT_OF_STOCK');
-        }
-
-        return true;
     }
 
     /**
@@ -704,7 +584,13 @@ class OpenmesConnector extends Module
         $options = [['id' => 0, 'name' => '— ' . $emptyLabel . ' —']];
 
         foreach ($lines as $line) {
-            $options[] = ['id' => (int) $line['id'], 'name' => $line['name']];
+            if (!is_array($line) || !isset($line['id'])) {
+                continue;
+            }
+            $options[] = [
+                'id'   => (int) $line['id'],
+                'name' => (string) ($line['name'] ?? ('#' . (int) $line['id'])),
+            ];
         }
 
         return $options;
